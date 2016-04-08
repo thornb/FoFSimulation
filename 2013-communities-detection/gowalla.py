@@ -1,0 +1,216 @@
+########################################################
+# The purpose of this script is to interact with the
+# MongoDB database. This script currently supports
+# launching data from MongoDB directly to the code 
+# and loading the data from the disk to the code
+# ---------------------------------------------------
+# Author: Tommy Nguyen
+# Last Modified: May 9, 2013
+########################################################
+
+import os.path
+import cPickle
+import math
+
+from math import *
+from networkx import nx
+from pymongo import Connection
+
+def get_connection(): return Connection('sd-01.cs.rpi.edu', 27017)
+def get_database(db, collection): return get_connection()[db][collection]
+
+##############################################################
+# Get Friendship Network from DB or Disk
+def get_friendship_network(filename='data/friendship_network.pck'):
+	if os.path.isfile(filename):
+		return cPickle.load(open(filename, 'rb'))
+	else:
+		network = get_network_friends_from_db()
+		cPickle.dump(network, open(filename, 'wb'))
+	return network	
+
+# Get Spatially-Aware Friendship Network
+def get_spatial_friendship_network(filename = 'data/gowalla_spatial_network.pck'):
+	if os.path.isfile(filename):
+		return cPickle.load(open(filename, 'rb'))
+	else:
+		network = get_spatial_network_friends_from_db()
+		cPickle.dump(network, open(filename, 'wb'))
+	return network
+
+# Get Location of Users from DB or Disk
+def get_users_locations(filename = 'data/users_locations.pck'):
+	if os.path.isfile(filename):
+		return cPickle.load(open(filename, 'rb'))
+	else:
+		locations = get_users_locations_from_db()
+		cPickle.dump(locations, open(filename, 'wb'))
+	return locations
+
+# Get Checkins of Users from DB or Disk
+def get_users_checkins(filename = 'data/users_checkins.pck'):
+	if os.path.isfile(filename):
+		return cPickle.load(open(filename, 'rb'))
+	else:
+		checkins = get_users_checkins_from_db()
+		cPickle.dump(checkins, open(filename, 'wb'))
+	return checkins
+
+# Get users ids
+def get_ids(filename = 'data/user_keys.pck'):
+	if os.path.isfile(filename):
+		return cPickle.load(open(filename, 'rb'))
+	else:
+		userids = get_users_ids_from_db()
+		cPickle.dump(userids, open(filename, 'wb'))
+	return userids
+
+# Get user hashed ids
+def get_hashed_ids(filename = 'data/gowalla_keys.txt'):
+	return dict([tuple(line.strip().split(' '))[::-1] for line in open(filename, 'r')])
+
+def calc_spatial_dist(user_a, user_b):
+	lat1, lng1 = user_a
+	lat2, lng2 = user_b
+	return calc_haversine(lng1, lat1, lng2, lat2)
+	
+# Calc. the spatial distance betweena a and b. 
+def calc_haversine(lon1, lat1, lon2, lat2):
+    # convert decimal degrees to radians 
+    lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
+    # haversine formula 
+    dlon = lon2 - lon1 
+    dlat = lat2 - lat1 
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * asin(sqrt(a)) 
+    km = 6367 * c
+    return km 
+
+def calc_physical_interaction(a_checkins, b_checkins):
+	count = 0
+	matches = {}
+
+	for a_lat, a_lng, a_time in a_checkins:
+		key = (a_lat, a_lng, a_time)
+		matches[key] = []
+		for b_lat, b_lng, b_time in b_checkins:
+			t_diff = math.fabs(a_time - b_time)
+			if t_diff < 30 * 60: 
+				dist = calc_haversine(a_lng, a_lat, b_lng, b_lat)
+				if dist < 1: matches[key].append((b_lat, b_lng, b_time))
+
+	G = nx.DiGraph()
+	G.add_edge('supersource', 'supersink', capacity = 0.0)
+	for key, matched in matches.items():
+		if len(matched) == 0: continue
+		G.add_edge('supersource', key, capacity = 1.0)
+		for node in matched: 
+			G.add_edge(key, node, capacity = 1.0)
+			G.add_edge(node, 'supersink', capacity = 1.0)
+
+	max_flow = nx.max_flow(G, 'supersource', 'supersink')	
+	return float(max_flow) / min(len(a_checkins), len(b_checkins))
+
+###############################################################
+# Loading the entire network from server. 
+def get_network_friends_from_db():
+	network = {}
+	cursor = get_database("gowalla", "network")
+	for item in cursor.find({}, {'friends': 1, 'user_id': 1}): 
+		network[item['user_id']] = set(item['friends'])
+	return network
+
+def get_spatial_network_friends_from_db():
+	selection = {'user_id' : 1, 'avg_location' : 1, 'friends' : 1}
+	cursor = get_database("gowalla", "network")
+
+	network = {}
+	for item in cursor.find({}, selection):
+		user_id = item['user_id']
+		lat = float(item['avg_location'][0])
+		lng = float(item['avg_location'][1])
+		if lat != -1 and lng != -1: network[user_id] = set(item['friends'])
+
+	for user in network.keys():
+		friends = [f for f in network[user] if f in network and f != user]
+		network[user] = set(friends)
+
+	G = nx.Graph()
+	for node, friends in network.items():
+		edges = [(node, f) for f in friends]
+		G.add_edges_from(edges)
+
+	lcc = set(nx.connected_components(G)[0])
+	lcc_network = {}
+
+	for user in lcc:
+		friends = [f for f in network[user] if f in lcc] 
+		lcc_network[user] = set(friends)
+		
+	return lcc_network
+
+# Loading the entire network from server. 
+def get_users_locations_from_db():
+	locations = {}
+	cursor = get_database("gowalla", "network")
+	for item in cursor.find({}, {'avg_location': 1, 'user_id': 1}):
+		user_id = item['user_id']
+		lat, lng = item['avg_location']
+		if lat != -1 and lng != -1: locations[user_id] = (lat, lng)
+	return locations
+
+# Loading the userids
+def get_users_ids_from_db():
+	user_ids = {}
+	cursor = get_database("gowalla", "hashed_ids")
+	for item in cursor.find({}): 
+		user_ids[item['value']] = item['user_id']
+	return user_ids
+
+# Loading checkins
+def get_users_checkins_from_db():
+	checkins = {}
+	cursor = get_database("gowalla", "network")
+	for item in cursor.find({}, {'checkins' : 1, 'user_id': 1}):
+		user_id = item['user_id']
+		checkins[user_id] = item['checkins']
+	return checkins
+
+def get_weighted_network():
+	edges = [line.strip().split(' ') for line in open('spatial_network.txt', 'r')]
+	user_locations = get_users_locations()
+	output = open('spatial_network_weighted.txt', 'w')
+
+	for a, b in edges:
+		lat1, lng1 = user_locations[a]
+		lat2, lng2 = user_locations[b]
+		d = calc_haversine(lng1, lat1, lng2, lat2)
+		if d <= 0.0152115030237: d = 0.001
+		dist = 1.0 / d
+		if a == 'therealadam':
+			a = '1139110'
+		if b == 'therealadam': 
+			b = '1139110'
+		output.write('%s %s %s \n' % (str(a), str(b), str(dist)))	
+
+def dump_weighted_network_max():
+	network = get_spatial_friendship_network()
+	locations = get_users_locations()
+
+	edges = set()
+	for user, friends in network.items():
+		for friend in friends:
+			if (user, friend) not in edges:
+				if (friend, user) not in edges:
+					edges.add((user, friend))
+
+	for a, b in edges:
+		lat1, lng1 = locations[a]
+		lat2, lng2 = locations[b]
+		d = calc_haversine(lng1, lat1, lng2, lat2)
+		if d <= 1.0: d = 1
+		if a == 'therealadam': a = '2898179'
+		if b == 'therealadam': b = '2898179'
+		print a, b, 1 / d
+
+
